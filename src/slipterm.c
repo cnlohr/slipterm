@@ -4,8 +4,6 @@
 //   1) Should we use ctrl+] like IDF?
 //   2) Actually test.
 
-#include <asm/termios.h>
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,12 +20,17 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
-#include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <netinet/ether.h>
 #include <linux/stat.h>
 #include <dirent.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+
+//#include <termios.h>
+#include <asm-generic/termbits.h>
 
 #define GENERAL_BUFFER_LENGTH 2048
 #define NETWORK_BUFFER_LENGTH 2048
@@ -45,39 +48,81 @@
 // Therefore, you can't just resend a SLIP_END when in network mode to send
 //  a new packet.
 
-#define SLIP_END             0300    /* indicates end of packet */
-#define SLIP_ESC             0333    /* indicates byte stuffing */
-#define SLIP_ESC_END         0334    /* ESC ESC_END means END data byte */
-#define SLIP_ESC_ESC         0335    /* ESC ESC_ESC means ESC data byte */
+#define SLIP_END             0300    /* indicates end of packet = 192 */
+#define SLIP_ESC             0333    /* indicates byte stuffing = 219 */
+#define SLIP_ESC_END         0334    /* ESC ESC_END means END data byte = 220 */
+#define SLIP_ESC_ESC         0335    /* ESC ESC_ESC means ESC data byte = 221 */
 
 
-int    iSerialPort;
-int    iRawSocket;
+int      iSerialPort = 0;
+int      iRawSocket = 0;
+char      bQuitting = 0;
+char      bHasReceivedMatchingMAC = 0;
+uint8_t   pMatchingMAC[6];
 pthread_t thdNetworkReceive;
 pthread_t thdUserInput;
 struct termios tSavedTermios;
 struct ifreq ifrInterface;
 struct sockaddr_ll saRaw;
 
+
 void * NetworkReceiveThread( void * v )
 {
-	uint8_t rxbuff[NETWORK_BUFFER_LENGTH+3] = { 0 };
-	rxbuff[0] = SLIP_ESC;
-	rxbuff[1] = SLIP_END;
-	while( 1 )
+	uint8_t rxbuff[NETWORK_BUFFER_LENGTH] = { 0 };
+	uint8_t passbuff[NETWORK_BUFFER_LENGTH*2+3];
+	passbuff[0] = SLIP_ESC;
+	passbuff[1] = SLIP_END;
+
+	while( !bQuitting )
 	{
-		int rx = recv( iRawSocket, rxbuff+2, sizeof( rxbuff ), 0 );
+		int rx = recv( iRawSocket, rxbuff, sizeof( rxbuff ), 0 );
 		if( rx < 0 ) break;
-		rxbuff[rx+2] = SLIP_END;
-		if( write( iSerialPort, rxbuff, rx + 3 ) < 0 )
+		if( rx < 12 ) continue;
+
+		// Filter traffic to either broadcast (multicast) or to something that
+		// matches the last MAC we've received.
+
+
+		if( ( rxbuff[0] & 1 ) ||
+			( bHasReceivedMatchingMAC && memcmp( rxbuff, pMatchingMAC, 6 ) == 0 ) )
 		{
-			fprintf( stderr, "Warning: could not write network frame to SLIP socket\n" );
+			int o = 2;
+			int i;
+			//printf( ":::PKTTX IN %4d:::", rx );
+			for( i = 0; i < rx; i++ )
+			{
+				uint8_t ttx = rxbuff[i];
+				if( ttx == SLIP_ESC )
+				{
+					passbuff[o++] = SLIP_ESC;
+					passbuff[o++] = SLIP_ESC_ESC;
+					//printf( "{ENDESC} " );
+				}
+				else if( ttx == SLIP_END )
+				{
+					passbuff[o++] = SLIP_ESC;
+					passbuff[o++] = SLIP_ESC_END;
+					//printf( "{ESCESC} " );
+				}
+				else
+				{
+					passbuff[o++] = ttx;
+					//printf( "%02x ", rxbuff[i] );
+				}
+			}
+			passbuff[o++] = SLIP_END;
+			if( write( iSerialPort, passbuff, o ) < 0 )
+			{
+				fprintf( stderr, "Warning: could not write network frame to SLIP socket\n" );
+			}
 		}
 	}
 
-	fprintf( stderr, "Error: Network disconnected. Exiting.\n" );
-
-	exit( -1 );
+	if( !bQuitting ) 
+	{
+		fprintf( stderr, "Error: Network disconnected. Exiting.\n" );
+		exit( 1 );
+	}
 }
 
 void * UserInputThread( void * v )
@@ -85,7 +130,7 @@ void * UserInputThread( void * v )
 	// TODO: Configure user input to disable local echo.
 
 	struct termios tp; 
-	if( tcgetattr( STDIN_FILENO, &tp) == -1 )
+	if( ioctl( STDIN_FILENO, TCGETS, &tp) == -1 )
 	{
 		fprintf( stderr, "Warning: Could not get local echo on user input.\n" );
 	}
@@ -96,7 +141,7 @@ void * UserInputThread( void * v )
     tp.c_lflag &= ~ECHO;   // Disable local echo.
 	tp.c_lflag &= ~ICANON; // Also disable canonical mode.
 
-    if (tcsetattr( STDIN_FILENO, TCSAFLUSH, &tp) == -1 )
+    if (ioctl( STDIN_FILENO, TCSETSF, &tp) == -1 )
 	{
 		fprintf( stderr, "Warning: Could not disable local echo on user input.\n" );
 	}
@@ -111,13 +156,16 @@ void * UserInputThread( void * v )
 
 void TXMessage( uint8_t * netbuf, int networkbufferplace )
 {
+	memcpy( pMatchingMAC, netbuf + 6, 6 );
+	bHasReceivedMatchingMAC = 1;
+
 	// Acutally received a packet!
 	saRaw.sll_ifindex = ifrInterface.ifr_ifindex;
 	saRaw.sll_halen = ETH_ALEN;
 	memcpy( saRaw.sll_addr, netbuf+6, 6 );
 
 	if (sendto( iRawSocket, netbuf, networkbufferplace, 0,
-		(struct sockaddr*)&socket_address,
+		(struct sockaddr*)&saRaw,
 		sizeof(struct sockaddr_ll)) < 0)
 	{
 		fprintf( stderr, "Warning: Could not transmit packet\n" );
@@ -127,8 +175,9 @@ void TXMessage( uint8_t * netbuf, int networkbufferplace )
 void SignalHandler()
 {
 	// Re-enable
+	bQuitting = 1;
 
-    if (tcsetattr( STDIN_FILENO, TCSAFLUSH, &tSavedTermios ) == -1 )
+    if (ioctl( STDIN_FILENO, TCSETSF, &tSavedTermios ) == -1 )
 	{
 		fprintf( stderr, "Warning: Could not re-enable local echo on user input.\n" );
 	}
@@ -139,7 +188,7 @@ void SignalHandler()
 
 int main( int argc, char ** argv )
 {
-	char * selected_port = 0;
+	const char * selected_port = 0;
 	int    selected_baud = 115200;
 	char * selected_iface = 0;
 	char   printdetect = 1;
@@ -243,13 +292,13 @@ int main( int argc, char ** argv )
 		// Prefer ttyUSB to ttyACM.
 		const char * searchports[] = {
 			"/dev/ttyACM0",
-			"/dev/ttyUSB0",
-			0 };
-		const char * sp;
-		for( sp = searchports[0]; *sp; sp++ )
+			"/dev/ttyUSB0" };
+		int idx;
+		for( idx = 0; idx < sizeof(searchports)/sizeof(searchports[0]); idx++ )
 		{
+			const char * sp = searchports[idx];
 			struct stat statbuf = { 0 };
-			if( stat( sp, &statbuf ) == 0 && !S_ISDIR(statbuf) )
+			if( stat( sp, &statbuf ) == 0 && !S_ISDIR(statbuf.st_mode) )
 			{
 				selected_port = sp;
 				break;
@@ -300,8 +349,8 @@ int main( int argc, char ** argv )
 
 	if( printdetect )
 	{
-		fprintf( stderr, "slipterm version " SLIPTERM_VERSION " configuration:\n
-			"interface %s\nport %s\nbaud%d\n", 
+		fprintf( stderr, "slipterm version " SLIPTERM_VERSION " configuration:\n"
+			"interface %s\nport      %s\nbaud      %d\n", 
 			selected_iface, selected_port, selected_baud );
 
 		//If -r flag used, exit.
@@ -408,6 +457,7 @@ int main( int argc, char ** argv )
 
 			if( rx < 0 )
 			{
+				if( bQuitting ) break;
 				fprintf( stderr, "Error: Serial port read failed.\n" );
 				return -19;
 			}
@@ -416,6 +466,7 @@ int main( int argc, char ** argv )
 			for( i = 0; i < rx; i++ )
 			{
 				uint8_t c = buf[i];
+
 				switch( state )
 				{
 				case STATE_DEFAULT:
@@ -458,7 +509,11 @@ int main( int argc, char ** argv )
 						break;
 					case SLIP_END:
 					{
-						TXMessage( netbuf, networkbufferplace );
+						if( networkbufferplace > 12 )
+						{
+							//printf( "TXING %d  %02x %02x\n", networkbufferplace, netbuf[0], netbuf[1] );
+							TXMessage( netbuf, networkbufferplace );
+						}
 						networkbufferplace = 0;
 						state = STATE_DEFAULT;
 						break;
@@ -486,7 +541,11 @@ int main( int argc, char ** argv )
 					case SLIP_END:
 						// We use this as another mechanism to indicate send.
 						// only difference here is we stay in network mode.
-						TXMessage( netbuf, networkbufferplace );
+						if( networkbufferplace > 12 )
+						{
+							printf( "ESCAPE TXING %d  %02x %02x\n", networkbufferplace, netbuf[0], netbuf[1] );
+							TXMessage( netbuf, networkbufferplace );
+						}
 						networkbufferplace = 0;
 						state = STATE_IN_PACKET;
 						break;
@@ -510,9 +569,14 @@ int main( int argc, char ** argv )
 			if( textbufferplace )
 			{
 				write( 0, textbuffer, textbufferplace );
+				textbufferplace = 0;
 			}
 		}
 	}
+
+	pthread_join( thdNetworkReceive, 0 );
+	// We don't wait on user input thread.
+	// pthread_join( thdUserInput, 0 );
 
 	return 0;
 }

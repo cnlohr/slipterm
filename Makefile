@@ -1,7 +1,7 @@
 all : slipterm
 
 slipterm : src/slipterm.c
-	gcc -o $@ $^
+	gcc -o $@ $^ -lpthread
 
 clean :
 	rm -rf *.o src/*~ *~
